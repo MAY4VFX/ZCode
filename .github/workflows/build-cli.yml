@@ -47,13 +47,13 @@ jobs:
           if [ -n "$INPUT_REF" ]; then
             TAG="$INPUT_REF"
           else
-            TAG="$(curl -fsSL https://api.github.com/repos/zai-org/ZCode/releases/latest | jq -r '.tag_name')"
+            TAG="$(gh api repos/zai-org/ZCode/releases/latest --jq '.tag_name')"
           fi
 
-          OBJ="$(curl -fsSL "https://api.github.com/repos/zai-org/ZCode/git/ref/tags/${TAG}")"
+          OBJ="$(gh api "repos/zai-org/ZCode/git/ref/tags/${TAG}")"
           SHA="$(jq -r '.object.sha' <<<"$OBJ")"
           if [ "$(jq -r '.object.type' <<<"$OBJ")" = "tag" ]; then
-            SHA="$(curl -fsSL "https://api.github.com/repos/zai-org/ZCode/git/tags/${SHA}" | jq -r '.object.sha')"
+            SHA="$(gh api "repos/zai-org/ZCode/git/tags/${SHA}" --jq '.object.sha')"
           fi
 
           RELEASE_TAG="$TAG"
