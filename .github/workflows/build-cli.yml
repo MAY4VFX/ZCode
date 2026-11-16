@@ -155,16 +155,17 @@ jobs:
           SHA: ${{ needs.resolve.outputs.sha }}
         run: |
           set -eu
-          # Синхронизируем main форка с собранным коммитом апстрима
+          # Клонируем форк и ставим тег релиза на коммит апстрима
+          # (main форка не трогаем: в нём наши CI-коммиты, fast-forward невозможен)
           git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
           cd repo
-          git fetch --quiet origin
-          if git cat-file -e "$SHA" 2>/dev/null; then
-            :
-          else
+          if ! git cat-file -e "$SHA" 2>/dev/null; then
             git fetch --quiet "https://github.com/zai-org/ZCode.git" "$SHA" --depth=1
           fi
-          git push --quiet origin "$SHA":refs/heads/main
+          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            git tag "$RELEASE_TAG" "$SHA"
+            git push --quiet origin "refs/tags/${RELEASE_TAG}"
+          fi
           cd ..
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -173,7 +174,6 @@ jobs:
           else
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --target "$SHA" \
               --title "ZCode CLI $RELEASE_TAG" \
               --notes "Автосборка CLI из [zai-org/ZCode](${TAG}) — коммит \`${SHA:0:10}\`.
 
