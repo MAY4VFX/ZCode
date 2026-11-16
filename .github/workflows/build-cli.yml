@@ -1,0 +1,181 @@
+name: Build ZCode CLI
+
+# Автосборка CLI из zai-org/ZCode: раз в сутки проверяем свежий релиз апстрима,
+# собираем SEA-бинарь и публикуем релиз в этом форке.
+
+on:
+  schedule:
+    - cron: "23 5 * * *" # ежедневно, UTC
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Тег или ветка zai-org/ZCode для сборки (пусто = последний релиз)"
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-cli.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-cli
+  cancel-in-progress: true
+
+env:
+  # CLI-сборка не использует Electron-рантайм — не качаем его бинарники
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+jobs:
+  resolve:
+    name: Определить тег апстрима
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sha: ${{ steps.meta.outputs.sha }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      build: ${{ steps.meta.outputs.build }}
+    steps:
+      - name: Разрешить тег и коммит
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -eu
+          if [ -n "$INPUT_REF" ]; then
+            TAG="$INPUT_REF"
+          else
+            TAG="$(curl -fsSL https://api.github.com/repos/zai-org/ZCode/releases/latest | jq -r '.tag_name')"
+          fi
+
+          OBJ="$(curl -fsSL "https://api.github.com/repos/zai-org/ZCode/git/ref/tags/${TAG}")"
+          SHA="$(jq -r '.object.sha' <<<"$OBJ")"
+          if [ "$(jq -r '.object.type' <<<"$OBJ")" = "tag" ]; then
+            SHA="$(curl -fsSL "https://api.github.com/repos/zai-org/ZCode/git/tags/${SHA}" | jq -r '.object.sha')"
+          fi
+
+          RELEASE_TAG="$TAG"
+          if [[ ! "$TAG" =~ ^v ]]; then
+            RELEASE_TAG="cli-${TAG}-$(date -u +%Y%m%d%H%M)"
+          fi
+
+          BUILD=true
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            LATEST_OURS="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName // empty' 2>/dev/null || true)"
+            if [ "$LATEST_OURS" = "$RELEASE_TAG" ]; then
+              BUILD=false
+              echo "Апстрим-релиз $RELEASE_TAG уже собран — пропускаем."
+            fi
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "release_tag=$RELEASE_TAG"
+            echo "build=$BUILD"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: SEA ${{ matrix.target }}
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-14
+          - target: linux-x64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: zai-org/ZCode
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+          cache: pnpm
+
+      - name: Установить зависимости
+        run: pnpm install --frozen-lockfile
+
+      - name: Собрать CLI
+        run: pnpm --filter @zcode/cli... build
+
+      - name: Собрать SEA-бинарь
+        run: pnpm --filter @zcode/cli sea --target ${{ matrix.target }}
+
+      - name: Показать артефакты
+        run: ls -la apps/zcode-cli/packages/cli/dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zcode-${{ matrix.target }}
+          path: apps/zcode-cli/packages/cli/dist/zcode-${{ matrix.target }}
+          if-no-files-found: error
+
+  release:
+    name: Опубликовать релиз
+    needs: [resolve, build]
+    if: needs.resolve.outputs.build == 'true' && !cancelled() && success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачать артефакты
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Контрольные суммы
+        run: |
+          cd dist
+          sha256sum zcode-* | tee SHA256SUMS
+
+      - name: Опубликовать релиз в форке
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -eu
+          # Синхронизируем main форка с собранным коммитом апстрима
+          git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
+          cd repo
+          git fetch --quiet origin
+          if git cat-file -e "$SHA" 2>/dev/null; then
+            :
+          else
+            git fetch --quiet "https://github.com/zai-org/ZCode.git" "$SHA" --depth=1
+          fi
+          git push --quiet origin "$SHA":refs/heads/main
+          cd ..
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Релиз $RELEASE_TAG уже существует — обновляем ассеты."
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/zcode-* dist/SHA256SUMS
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SHA" \
+              --title "ZCode CLI $RELEASE_TAG" \
+              --notes "Автосборка CLI из [zai-org/ZCode](${TAG}) — коммит \`${SHA:0:10}\`.
+
+          Бинари — SEA (single executable): всё встроено, Node.js не нужен.
+
+          - \`zcode-darwin-arm64\` — macOS Apple Silicon
+          - \`zcode-linux-x64\` — Linux x86_64
+
+          macOS: бинарь подписан ad-hoc код-сигнингом. При первом запуске: \`chmod +x zcode-darwin-arm64 && xattr -d com.apple.quarantine zcode-darwin-arm64 || true\`" \
+              dist/zcode-* dist/SHA256SUMS
+          fi
