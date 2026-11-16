@@ -86,7 +86,7 @@ jobs:
       matrix:
         include:
           - target: darwin-arm64
-            runner: macos-14
+            runner: macos-15
           - target: linux-x64
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
@@ -106,8 +106,14 @@ jobs:
           node-version: 24.14.0
           cache: pnpm
 
-      - name: Установить зависимости
-        run: pnpm install --frozen-lockfile
+      - name: Установить зависимости (с ретраем — у pnpm бывает гонка rename в node_modules)
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile && exit 0
+            echo "Попытка $i не удалась, ждём 20с и пробуем снова..."
+            sleep 20
+          done
+          exit 1
 
       - name: Собрать CLI
         run: pnpm --filter @zcode/cli... build
