@@ -115,8 +115,8 @@ jobs:
           done
           exit 1
 
-      - name: Собрать CLI
-        run: pnpm --filter @zcode/cli... build
+      - name: Собрать CLI и его зависимости (root build:sea:prepare)
+        run: pnpm build:sea:prepare
 
       - name: Собрать SEA-бинарь
         run: pnpm --filter @zcode/cli sea --target ${{ matrix.target }}
